@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Browser AI Agent</title>
+  <link rel="stylesheet" href="styles/popup.css">
+</head>
+<body>
+  <div id="root">
+    <div class="header">
+      <h1>Browser AI Agent</h1>
+      <button id="settingsBtn" class="icon-button">⚙️</button>
+    </div>
+    
+    <div id="chatContainer" class="chat-container">
+      <!-- Chat messages will be inserted here -->
+    </div>
+
+    <div class="input-container">
+      <textarea 
+        id="userInput" 
+        placeholder="Enter your task here..."
+        rows="3"
+      ></textarea>
+      <button id="submitBtn" class="submit-button">Send</button>
+    </div>
+
+    <div id="statusBar" class="status-bar">
+      <span id="statusText">Ready</span>
+      <div id="statusIndicator" class="status-indicator"></div>
+    </div>
+  </div>
+  <script src="js/popup.js" type="module"></script>
+</body>
+</html>
