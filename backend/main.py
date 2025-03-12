@@ -1,4 +1,4 @@
-from fastapi import FastAPI, WebSocket, HTTPException, BackgroundTasks
+from fastapi import FastAPI, WebSocket, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Dict, Any, Optional
@@ -6,9 +6,9 @@ from loguru import logger
 import json
 import asyncio
 import os
+from datetime import datetime
 
 from browser_controller import browser_controller
-from task_processor import task_processor
 
 # Configure logging
 logger.add("browser_ai.log", rotation="500 MB")
@@ -37,19 +37,14 @@ class Context(BaseModel):
 
 class TaskRequest(BaseModel):
     task_text: str
-    context: Context
+    context: Optional[Context] = None
+    api_key: Optional[str] = None
+    model: Optional[str] = "gpt-4"
 
 class TaskResponse(BaseModel):
     task_id: str
-    parsed_intent: str
-    planned_actions: List[Dict[str, Any]]
-    estimated_time: str
-
-class ExecutionResponse(BaseModel):
     status: str
-    current_step: int
-    total_steps: int
-    current_action: str
+    message: str
 
 # WebSocket connection manager
 async def broadcast_message(message: Dict[str, Any]):
@@ -61,106 +56,77 @@ async def broadcast_message(message: Dict[str, Any]):
             logger.error(f"Error broadcasting message: {e}")
             active_connections.remove(connection)
 
+# Status update callback
+async def status_callback(update: Dict[str, Any]):
+    """Handle status updates from the browser controller."""
+    await broadcast_message(update)
+    
+    # Update task storage
+    task_id = update.get("task_id")
+    if task_id and task_id in tasks:
+        tasks[task_id].update(update)
+
 # Task handling
 @app.post("/api/tasks", response_model=TaskResponse)
-async def create_task(task_request: TaskRequest):
-    """Create a new task from natural language input."""
+async def create_task(task_request: TaskRequest, background_tasks: BackgroundTasks):
+    """Create and execute a new task."""
     try:
-        # Process the task
-        task = task_processor.parse_task(task_request.task_text, task_request.context.dict())
+        # Generate task ID
+        task_id = f"task-{datetime.now().timestamp()}"
         
-        # Validate the task
-        if not task_processor.validate_task(task):
-            raise HTTPException(status_code=400, detail="Invalid task structure")
+        # Create task object
+        task = {
+            "task_id": task_id,
+            "task_text": task_request.task_text,
+            "context": task_request.context.dict() if task_request.context else {},
+            "status": "created",
+            "created_at": datetime.now().isoformat()
+        }
         
-        # Store the task
-        tasks[task["task_id"]] = task
+        # Store task
+        tasks[task_id] = task
+        
+        # Configure browser controller
+        if task_request.api_key:
+            browser_controller.api_key = task_request.api_key
+        if task_request.model:
+            browser_controller.model = task_request.model
+            
+        # Set callback for status updates
+        browser_controller.callback = status_callback
+        
+        # Execute task in background
+        background_tasks.add_task(execute_task, task)
         
         return TaskResponse(
-            task_id=task["task_id"],
-            parsed_intent=task["parsed_intent"],
-            planned_actions=task["planned_actions"],
-            estimated_time=task["estimated_time"]
+            task_id=task_id,
+            status="scheduled",
+            message="Task execution scheduled"
         )
+        
     except Exception as e:
         logger.error(f"Error creating task: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.post("/api/execute/{task_id}")
-async def execute_task(task_id: str, background_tasks: BackgroundTasks):
-    """Execute a task in the background."""
-    if task_id not in tasks:
-        raise HTTPException(status_code=404, detail="Task not found")
-    
-    task = tasks[task_id]
-    background_tasks.add_task(_execute_task_background, task)
-    
-    return {
-        "status": "scheduled",
-        "task_id": task_id,
-        "message": "Task execution started"
-    }
-
-async def _execute_task_background(task: Dict[str, Any]):
-    """Execute a task and handle its lifecycle."""
-    task_id = task["task_id"]
-    total_steps = len(task["planned_actions"])
-    
+async def execute_task(task: Dict[str, Any]):
+    """Execute a task using the browser controller."""
     try:
-        # Update task status
-        tasks[task_id]["status"] = "running"
-        await broadcast_message({
-            "type": "task_update",
-            "task_id": task_id,
-            "status": "running",
-            "step": 0,
-            "total_steps": total_steps
-        })
-        
-        # Execute the task
-        results = await browser_controller.execute_task(task)
-        
-        # Process results
-        success = all(r["status"] == "success" for r in results)
-        final_status = "completed" if success else "failed"
-        
-        # Update task status
-        tasks[task_id]["status"] = final_status
-        tasks[task_id]["results"] = results
-        
-        # Broadcast completion
-        await broadcast_message({
-            "type": "task_update",
-            "task_id": task_id,
-            "status": final_status,
-            "results": results
-        })
-        
+        result = await browser_controller.execute_task(task)
+        tasks[task["task_id"]].update(result)
     except Exception as e:
-        logger.error(f"Error executing task {task_id}: {e}")
-        tasks[task_id]["status"] = "failed"
-        tasks[task_id]["error"] = str(e)
-        
-        await broadcast_message({
-            "type": "task_update",
-            "task_id": task_id,
+        logger.error(f"Error executing task: {e}")
+        tasks[task["task_id"]].update({
             "status": "failed",
             "error": str(e)
         })
 
-@app.get("/api/tasks/{task_id}/status")
+@app.get("/api/tasks/{task_id}")
 async def get_task_status(task_id: str):
-    """Get the current status of a task."""
+    """Get the current status and results of a task."""
     if task_id not in tasks:
         raise HTTPException(status_code=404, detail="Task not found")
     
-    task = tasks[task_id]
-    return {
-        "status": task.get("status", "unknown"),
-        "results": task.get("results", []),
-        "error": task.get("error"),
-        "execution_time": task.get("execution_time")
-    }
+    return tasks[task_id]
 
 @app.websocket("/ws")
 async def websocket_endpoint(websocket: WebSocket):
