@@ -1,135 +1,129 @@
-from browser_use import Browser
-from typing import Dict, Any, List, Optional
+from browser_use import Agent
+from langchain_openai import ChatOpenAI
+from typing import Dict, Any, List, Optional, Callable
 from loguru import logger
 import asyncio
 import json
+import os
+from datetime import datetime
 
 class BrowserController:
-    def __init__(self):
-        self._browser: Optional[Browser] = None
+    def __init__(self, api_key: str = None, model: str = "gpt-4", callback: Callable = None):
+        """Initialize the browser controller with browser-use Agent.
+        
+        Args:
+            api_key: OpenAI API key (can also be set via OPENAI_API_KEY env var)
+            model: LLM model to use
+            callback: Optional callback function for status updates
+        """
+        if api_key:
+            os.environ["OPENAI_API_KEY"] = api_key
+            
+        self.model = model
+        self.callback = callback
         self._current_task: Optional[Dict[str, Any]] = None
-        self._task_queue = asyncio.Queue()
-
+        self._agent: Optional[Agent] = None
+        
     async def initialize(self):
-        """Initialize the browser instance."""
-        if not self._browser:
+        """Initialize the browser-use Agent."""
+        if not self._agent:
             try:
-                self._browser = await Browser.create()
-                logger.info("Browser instance created successfully")
+                llm = ChatOpenAI(model=self.model)
+                self._agent = Agent(
+                    llm=llm,
+                    headless=False,  # Show browser for user visibility
+                    human_in_the_loop=True  # Enable human oversight
+                )
+                logger.info("Browser-use Agent initialized successfully")
             except Exception as e:
-                logger.error(f"Failed to create browser instance: {e}")
+                logger.error(f"Failed to initialize browser-use Agent: {e}")
                 raise
 
     async def close(self):
-        """Close the browser instance."""
-        if self._browser:
-            await self._browser.close()
-            self._browser = None
-            logger.info("Browser instance closed")
+        """Clean up resources."""
+        if self._agent:
+            try:
+                await self._agent.close()
+                self._agent = None
+                logger.info("Browser-use Agent closed")
+            except Exception as e:
+                logger.error(f"Error closing browser-use Agent: {e}")
 
-    async def execute_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
-        """Execute a single browser action."""
-        if not self._browser:
+    async def execute_task(self, task: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a task using the browser-use Agent.
+        
+        Args:
+            task: Dictionary containing task details
+                - task_text: The natural language task description
+                - context: Additional context for the task
+                
+        Returns:
+            Dictionary containing task results
+        """
+        if not self._agent:
             await self.initialize()
 
-        action_type = action.get("type")
+        self._current_task = task
+        task_id = task.get("task_id", f"task-{datetime.now().timestamp()}")
+        
         try:
-            if action_type == "navigate":
-                await self._browser.goto(action["url"])
-                return {"status": "success", "action": "navigate", "url": action["url"]}
-
-            elif action_type == "click":
-                element = await self._browser.find_element(action["selector"])
-                await element.click()
-                return {"status": "success", "action": "click", "selector": action["selector"]}
-
-            elif action_type == "type":
-                element = await self._browser.find_element(action["selector"])
-                await element.type(action["text"])
-                return {"status": "success", "action": "type", "selector": action["selector"]}
-
-            elif action_type == "extract":
-                element = await self._browser.find_element(action["selector"])
-                text = await element.text()
-                return {
-                    "status": "success",
-                    "action": "extract",
-                    "selector": action["selector"],
-                    "result": text
-                }
-
-            elif action_type == "wait":
-                await asyncio.sleep(action.get("duration", 1))
-                return {"status": "success", "action": "wait", "duration": action.get("duration", 1)}
-
-            else:
-                raise ValueError(f"Unknown action type: {action_type}")
-
-        except Exception as e:
-            logger.error(f"Error executing action {action_type}: {e}")
+            # Update status
+            await self._update_status("running", task_id)
+            
+            # Execute task using browser-use Agent
+            result = await self._agent.run(
+                task=task["task_text"],
+                context=task.get("context", {}),
+                max_steps=50  # Limit maximum steps for safety
+            )
+            
+            # Process results
+            success = result.get("success", False)
+            status = "completed" if success else "failed"
+            
+            # Update task status
+            await self._update_status(status, task_id, result)
+            
             return {
-                "status": "error",
-                "action": action_type,
+                "task_id": task_id,
+                "status": status,
+                "result": result,
+                "error": None if success else result.get("error")
+            }
+            
+        except Exception as e:
+            logger.error(f"Error executing task {task_id}: {e}")
+            await self._update_status("failed", task_id, {"error": str(e)})
+            return {
+                "task_id": task_id,
+                "status": "failed",
+                "result": None,
                 "error": str(e)
             }
-
-    async def execute_task(self, task: Dict[str, Any]) -> List[Dict[str, Any]]:
-        """Execute a complete task consisting of multiple actions."""
-        self._current_task = task
-        results = []
-
-        try:
-            for action in task["planned_actions"]:
-                result = await self.execute_action(action)
-                results.append(result)
-                
-                if result["status"] == "error":
-                    logger.error(f"Task failed at action: {action}")
-                    break
-
-        except Exception as e:
-            logger.error(f"Task execution failed: {e}")
-            results.append({
-                "status": "error",
-                "action": "task_execution",
-                "error": str(e)
-            })
-
         finally:
             self._current_task = None
 
-        return results
-
-    async def get_page_state(self) -> Dict[str, Any]:
-        """Get current page state information."""
-        if not self._browser:
-            return {"error": "Browser not initialized"}
-
-        try:
-            return {
-                "url": await self._browser.current_url(),
-                "title": await self._browser.title(),
-                "is_loading": await self._browser.is_loading()
+    async def _update_status(self, status: str, task_id: str, details: Dict[str, Any] = None):
+        """Send status updates through the callback if provided."""
+        if self.callback:
+            update = {
+                "type": "task_update",
+                "task_id": task_id,
+                "status": status,
+                "timestamp": datetime.now().isoformat()
             }
-        except Exception as e:
-            logger.error(f"Error getting page state: {e}")
-            return {"error": str(e)}
-
-    async def take_screenshot(self, path: str) -> bool:
-        """Take a screenshot of the current page."""
-        if not self._browser:
-            return False
-
-        try:
-            await self._browser.screenshot(path)
-            return True
-        except Exception as e:
-            logger.error(f"Error taking screenshot: {e}")
-            return False
+            if details:
+                update.update(details)
+            await self.callback(update)
 
     def get_current_task(self) -> Optional[Dict[str, Any]]:
         """Get information about the currently executing task."""
         return self._current_task
+
+    @property
+    def is_busy(self) -> bool:
+        """Check if the agent is currently executing a task."""
+        return self._current_task is not None
 
 # Create a singleton instance
 browser_controller = BrowserController()
